@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::thread;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -6,27 +7,35 @@ use std::net::SocketAddr;
 use std::mem::size_of;
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs::File;
+use std::io::{Write, Read};
+use std::io::{BufRead, BufReader};
 
-use crate::constants::CANT_CAFETERIAS;
+use crate::constants::{CANT_CAFETERIAS, ACK, SUMAR_PUNTOS, INFO};
 
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Cafeteria {
     id: usize,
+    pedidos_path: String,
     coordinador: Arc<(Mutex<Option<usize>>, Condvar)>,
     ack: Arc<(Mutex<Option<usize>>, Condvar)>,
     socket: UdpSocket,
     termino: Arc<AtomicBool>,
+    cuentas: Arc<Mutex<HashMap<u32, i32>>>,
+    // pedido_actual: Arc<(Mutex<Option<Pedido>>, Condvar)>,
 }
 
 impl Cafeteria {
-    pub fn new(id: usize) -> Cafeteria {
+    pub fn new(id: usize, pedidos_path: String) -> Cafeteria {
         Cafeteria {
             id,
+            pedidos_path,
             coordinador: Arc::new((Mutex::new(None), Condvar::new())),
             ack: Arc::new((Mutex::new(None), Condvar::new())),
             socket: UdpSocket::bind(Self::election_address(id)).unwrap(),
             termino: Arc::new(AtomicBool::new(false)),
+            cuentas: Arc::new(Mutex::new(HashMap::new()))
         }
     }
 
@@ -37,6 +46,8 @@ impl Cafeteria {
             ack: self.ack.clone(),
             socket: self.socket.try_clone().unwrap(),
             termino: self.termino.clone(),
+            cuentas: self.cuentas.clone(),
+            pedidos_path: self.pedidos_path.clone()
         }
     }
 
@@ -49,26 +60,96 @@ impl Cafeteria {
     }
 
     pub fn run(&mut self) {
+        // let file = std::fs::File::open(&self.pedidos_path).unwrap();
+        // let reader = std::io::BufReader::new(file);
+        // let mut clone = self.clone();
+        // thread::spawn(move || clone.leer_pedidos(reader));
+        
         let socket = UdpSocket::bind(Self::transacion_address(self.id)).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        
         let mut clone = self.clone();
         thread::spawn(move || clone.responder());
         self.empezar_eleccion();
-        
+        let clone = self.clone();
+        let ack = Arc::new((Mutex::new(false), Condvar::new()));
+        let ack2 = ack.clone();
+        let socket_clone = socket.try_clone().unwrap();
+        thread::spawn(move || clone.recibir_mensajes(&(socket.try_clone().unwrap()), ack2));
         loop {
-            if self.obtener_coordinador() == self.id {
-                // soy el coordinador
-                break;
-            } else {
-                let mut buf: [u8; 1] = [0; 1];
-                socket.send_to(&buf, Self::transacion_address(self.coordinador.0.lock().unwrap().unwrap())).unwrap();
-                if socket.recv_from(&mut buf).is_err() {
-                    println!("Nodo {} coordinador {} murio", self.id, self.coordinador.0.lock().unwrap().unwrap());
-                    // abortar las restas de puntos que estoy haciendo, analizarlo
-                    *self.coordinador.0.lock().unwrap() = None;
-                    self.empezar_eleccion();
-                    println!("Nodo {} encontre coordinador {}", self.id, self.coordinador.0.lock().unwrap().unwrap());
+            let puntos_bytes: [u8; 4] = ((100 + (self.id * 100)) as i32).to_be_bytes();
+            let buffer = [SUMAR_PUNTOS, self.id as u8, puntos_bytes[0], puntos_bytes[1], puntos_bytes[2], puntos_bytes[3]];
+            let (lock, cvar) = &*ack;
+            socket_clone.send_to(&buffer, Self::transacion_address(self.obtener_coordinador())).unwrap();
+            let condvar_resp = cvar.wait_timeout_while(lock.lock().unwrap(), TIMEOUT, |ack| !*ack).unwrap();
+            if condvar_resp.1.timed_out() {
+                println!("[NODO {}] No se recibió ACK", self.id);
+                println!("[NODO {}] coordinador {} murio", self.id, self.coordinador.0.lock().unwrap().unwrap());
+                *self.coordinador.0.lock().unwrap() = None;
+                self.empezar_eleccion();
+                println!("[NODO {}] encontre coordinador {}", self.id, self.coordinador.0.lock().unwrap().unwrap());
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    fn leer_pedidos(&mut self, reader: std::io::BufReader<std::fs::File>) {
+        for line in reader.lines() {
+            let line = line.unwrap();
+            let mut split = line.split(',');
+            let id = split.next().unwrap().parse::<u32>().unwrap();
+            let puntos = split.next().unwrap().parse::<i32>().unwrap();
+            println!("id: {}, puntos: {}", id, puntos);
+        }
+    }
+
+    fn recibir_mensajes (&self, socket: &UdpSocket, ack: Arc<(Mutex<bool>, Condvar)>) {
+        let mut buffer: [u8; 6];
+        loop {
+            buffer = [0; 6];
+            let response = socket.recv_from(&mut buffer);
+            if response.is_ok() {
+                match buffer[0] {
+                    ACK => {
+                        println!("[NODO {}] ACK recibido", self.id);
+                        *ack.0.lock().unwrap() = true;
+                        ack.1.notify_one();
+                    }
+                    SUMAR_PUNTOS => {
+                        if self.obtener_coordinador() == self.id {
+                            let cuenta = buffer[1];
+                            let puntos = i32::from_be_bytes(buffer[2..].try_into().unwrap());
+                            println!("[COORDINADOR {}] Sumar {} puntos a la cuenta {}", self.id, puntos, cuenta);
+                            let mut cuentas = self.cuentas.lock().unwrap();
+                            let puntos_actuales = cuentas.entry(cuenta as u32).or_insert(0);
+                            *puntos_actuales += puntos as i32;
+                            println!("[COORDINADOR {}] Puntos nuevos de la cuenta {}: {}", self.id, cuenta, puntos_actuales);
+                            socket.send_to(&[ACK, 0, 0, 0, 0, 0], response.unwrap().1).unwrap();
+                            self.broadcast_info(&socket, cuenta, *puntos_actuales);
+                        }
+                    }
+                    INFO => {
+                        let cuenta = buffer[1];
+                        let puntos = i32::from_be_bytes(buffer[2..].try_into().unwrap());
+                        let mut cuentas = self.cuentas.lock().unwrap();
+                        cuentas.insert(cuenta as u32, puntos);
+                        for (cuenta, puntos) in cuentas.iter() {
+                            println!("[NODO {}] Cuenta {}: {}", self.id, cuenta, puntos);
+                        }
+                    }
+                    _ => {}
                 }
+            }
+        }
+    }
+
+    fn broadcast_info (&self, socket: &UdpSocket, cuenta: u8, puntos: i32) {
+        let puntos_bytes: [u8; 4] = puntos.to_be_bytes();
+        let buffer = [INFO, cuenta, puntos_bytes[0], puntos_bytes[1], puntos_bytes[2], puntos_bytes[3]];
+        for i in 0..CANT_CAFETERIAS {
+            if i != self.id {
+                println!("[COORDINADOR {}] Enviando INFO a la cafetería {}", self.id, i);
+                socket.send_to(&buffer, Self::transacion_address(i)).unwrap();
             }
         }
     }

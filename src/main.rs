@@ -11,7 +11,7 @@ fn main() {
             thread::Builder::new()
                 .name(format!("Cafeteria {}", id))
                 .spawn(move || {
-                    let mut node = Cafeteria::new(id);
+                    let mut node = Cafeteria::new(id, format!("./ejemplos/pedidos{}.txt", id));
                     node.run()
                 })
                 .unwrap(),
