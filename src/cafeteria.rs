@@ -1,19 +1,23 @@
 use std::collections::HashMap;
-use std::thread;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
-use std::net::UdpSocket;
-use std::net::SocketAddr;
-use std::mem::size_of;
 use std::convert::TryInto;
+use std::io::{BufRead};
+use std::mem::size_of;
+use std::net::SocketAddr;
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::fs::File;
-use std::io::{Write, Read};
-use std::io::{BufRead, BufReader};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
 
-use crate::constants::{CANT_CAFETERIAS, ACK, SUMAR_PUNTOS, INFO};
+use crate::constants::{ACK, CANT_CAFETERAS, CANT_CAFETERIAS, INFO, SUMAR_PUNTOS, TIEMPO_PEDIDO};
 
 pub const TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+pub struct Pedido {
+    pub cuenta: u32,
+    pub puntos: i32,
+}
 
 pub struct Cafeteria {
     id: usize,
@@ -23,7 +27,7 @@ pub struct Cafeteria {
     socket: UdpSocket,
     termino: Arc<AtomicBool>,
     cuentas: Arc<Mutex<HashMap<u32, i32>>>,
-    // pedido_actual: Arc<(Mutex<Option<Pedido>>, Condvar)>,
+    pedidos: Arc<(Mutex<Vec<Pedido>>, Condvar)>,
 }
 
 impl Cafeteria {
@@ -35,7 +39,8 @@ impl Cafeteria {
             ack: Arc::new((Mutex::new(None), Condvar::new())),
             socket: UdpSocket::bind(Self::election_address(id)).unwrap(),
             termino: Arc::new(AtomicBool::new(false)),
-            cuentas: Arc::new(Mutex::new(HashMap::new()))
+            cuentas: Arc::new(Mutex::new(HashMap::new())),
+            pedidos: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
         }
     }
 
@@ -47,63 +52,130 @@ impl Cafeteria {
             socket: self.socket.try_clone().unwrap(),
             termino: self.termino.clone(),
             cuentas: self.cuentas.clone(),
-            pedidos_path: self.pedidos_path.clone()
+            pedidos_path: self.pedidos_path.clone(),
+            pedidos: self.pedidos.clone(),
         }
     }
 
     pub fn election_address(id: usize) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], (8000 + id) as u16))
     }
-    
+
     pub fn transacion_address(id: usize) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], (9000 + id) as u16))
     }
 
     pub fn run(&mut self) {
-        // let file = std::fs::File::open(&self.pedidos_path).unwrap();
-        // let reader = std::io::BufReader::new(file);
-        // let mut clone = self.clone();
-        // thread::spawn(move || clone.leer_pedidos(reader));
-        
+        let mut handles = Vec::new();
+        let file = std::fs::File::open(&self.pedidos_path).unwrap();
+        let reader = std::io::BufReader::new(file);
+        let pedidos_clone = self.pedidos.clone();
+        handles.push(thread::spawn(move || {
+            Self::leer_pedidos(reader, pedidos_clone)
+        }));
+
         let socket = UdpSocket::bind(Self::transacion_address(self.id)).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let ack = Arc::new((Mutex::new(false), Condvar::new()));
+
+        for _ in 0..CANT_CAFETERAS {
+            let socket_clone = socket.try_clone().unwrap();
+            let mut clone = self.clone();
+            let ack_clone = ack.clone();
+            handles.push(thread::spawn(move || {
+                Self::cafetera(&mut clone, &socket_clone, ack_clone);
+            }));
+        }
+
         let mut clone = self.clone();
-        thread::spawn(move || clone.responder());
+        handles.push(thread::spawn(move || clone.responder()));
         self.empezar_eleccion();
         let clone = self.clone();
-        let ack = Arc::new((Mutex::new(false), Condvar::new()));
         let ack2 = ack.clone();
-        let socket_clone = socket.try_clone().unwrap();
-        thread::spawn(move || clone.recibir_mensajes(&(socket.try_clone().unwrap()), ack2));
-        loop {
-            let puntos_bytes: [u8; 4] = ((100 + (self.id * 100)) as i32).to_be_bytes();
-            let buffer = [SUMAR_PUNTOS, self.id as u8, puntos_bytes[0], puntos_bytes[1], puntos_bytes[2], puntos_bytes[3]];
-            let (lock, cvar) = &*ack;
-            socket_clone.send_to(&buffer, Self::transacion_address(self.obtener_coordinador())).unwrap();
-            let condvar_resp = cvar.wait_timeout_while(lock.lock().unwrap(), TIMEOUT, |ack| !*ack).unwrap();
-            if condvar_resp.1.timed_out() {
-                println!("[NODO {}] No se recibió ACK", self.id);
-                println!("[NODO {}] coordinador {} murio", self.id, self.coordinador.0.lock().unwrap().unwrap());
-                *self.coordinador.0.lock().unwrap() = None;
-                self.empezar_eleccion();
-                println!("[NODO {}] encontre coordinador {}", self.id, self.coordinador.0.lock().unwrap().unwrap());
-            }
-            thread::sleep(Duration::from_secs(5));
+        handles.push(thread::spawn(move || {
+            clone.recibir_mensajes(&(socket.try_clone().unwrap()), ack2)
+        }));
+
+        for handle in handles {
+            handle.join().unwrap();
         }
     }
 
-    fn leer_pedidos(&mut self, reader: std::io::BufReader<std::fs::File>) {
+    fn leer_pedidos(
+        reader: std::io::BufReader<std::fs::File>,
+        pedidos: Arc<(Mutex<Vec<Pedido>>, Condvar)>,
+    ) {
         for line in reader.lines() {
             let line = line.unwrap();
-            let mut split = line.split(',');
+            let mut split = line.split(';');
             let id = split.next().unwrap().parse::<u32>().unwrap();
             let puntos = split.next().unwrap().parse::<i32>().unwrap();
-            println!("id: {}, puntos: {}", id, puntos);
+            let pedido = Pedido { cuenta: id, puntos };
+            pedidos.0.lock().unwrap().push(pedido);
+            pedidos.1.notify_one();
+            thread::sleep(Duration::from_secs(TIEMPO_PEDIDO));
         }
     }
 
-    fn recibir_mensajes (&self, socket: &UdpSocket, ack: Arc<(Mutex<bool>, Condvar)>) {
+    pub fn cafetera(
+        cafeteria: &mut Cafeteria,
+        socket: &UdpSocket,
+        ack: Arc<(Mutex<bool>, Condvar)>,
+    ) {
+        loop {
+            let (lock, cvar) = &*(cafeteria.pedidos);
+            let mut pedido = Pedido {
+                cuenta: 0,
+                puntos: 0,
+            };
+            if let Ok(mut state) = cvar.wait_while(lock.lock().unwrap(), |pedidos_data| {
+                !(pedidos_data.first().is_some())
+            }) {
+                pedido = state.pop().unwrap();
+            }
+            thread::sleep(Duration::from_secs(10));
+            println!("Cafetera: Pedido listo {:?}", pedido);
+            let puntos_bytes: [u8; 4] = pedido.puntos.to_be_bytes();
+            let buffer = [
+                SUMAR_PUNTOS,
+                pedido.cuenta as u8,
+                puntos_bytes[0],
+                puntos_bytes[1],
+                puntos_bytes[2],
+                puntos_bytes[3],
+            ];
+            let (lock, cvar) = &*ack;
+            socket
+                .send_to(
+                    &buffer,
+                    Self::transacion_address(cafeteria.obtener_coordinador()),
+                )
+                .unwrap();
+            let condvar_resp = cvar
+                .wait_timeout_while(lock.lock().unwrap(), TIMEOUT, |ack| !*ack)
+                .unwrap();
+            if condvar_resp.1.timed_out() {
+                println!("[NODO {}] No se recibió ACK", cafeteria.id);
+                println!(
+                    "[NODO {}] coordinador {} murio",
+                    cafeteria.id,
+                    cafeteria.coordinador.0.lock().unwrap().unwrap()
+                );
+                *(cafeteria.coordinador.0.lock().unwrap()) = None;
+                cafeteria.empezar_eleccion();
+                println!(
+                    "[NODO {}] encontre coordinador {}",
+                    cafeteria.id,
+                    cafeteria.coordinador.0.lock().unwrap().unwrap()
+                );
+            }
+        }
+    }
+
+    fn recibir_mensajes(&self, socket: &UdpSocket, ack: Arc<(Mutex<bool>, Condvar)>) {
         let mut buffer: [u8; 6];
         loop {
             buffer = [0; 6];
@@ -119,12 +191,20 @@ impl Cafeteria {
                         if self.obtener_coordinador() == self.id {
                             let cuenta = buffer[1];
                             let puntos = i32::from_be_bytes(buffer[2..].try_into().unwrap());
-                            println!("[COORDINADOR {}] Sumar {} puntos a la cuenta {}", self.id, puntos, cuenta);
+                            println!(
+                                "[COORDINADOR {}] Sumar {} puntos a la cuenta {}",
+                                self.id, puntos, cuenta
+                            );
                             let mut cuentas = self.cuentas.lock().unwrap();
                             let puntos_actuales = cuentas.entry(cuenta as u32).or_insert(0);
                             *puntos_actuales += puntos as i32;
-                            println!("[COORDINADOR {}] Puntos nuevos de la cuenta {}: {}", self.id, cuenta, puntos_actuales);
-                            socket.send_to(&[ACK, 0, 0, 0, 0, 0], response.unwrap().1).unwrap();
+                            println!(
+                                "[COORDINADOR {}] Puntos nuevos de la cuenta {}: {}",
+                                self.id, cuenta, puntos_actuales
+                            );
+                            socket
+                                .send_to(&[ACK, 0, 0, 0, 0, 0], response.unwrap().1)
+                                .unwrap();
                             self.broadcast_info(&socket, cuenta, *puntos_actuales);
                         }
                     }
@@ -143,13 +223,25 @@ impl Cafeteria {
         }
     }
 
-    fn broadcast_info (&self, socket: &UdpSocket, cuenta: u8, puntos: i32) {
+    fn broadcast_info(&self, socket: &UdpSocket, cuenta: u8, puntos: i32) {
         let puntos_bytes: [u8; 4] = puntos.to_be_bytes();
-        let buffer = [INFO, cuenta, puntos_bytes[0], puntos_bytes[1], puntos_bytes[2], puntos_bytes[3]];
+        let buffer = [
+            INFO,
+            cuenta,
+            puntos_bytes[0],
+            puntos_bytes[1],
+            puntos_bytes[2],
+            puntos_bytes[3],
+        ];
         for i in 0..CANT_CAFETERIAS {
             if i != self.id {
-                println!("[COORDINADOR {}] Enviando INFO a la cafetería {}", self.id, i);
-                socket.send_to(&buffer, Self::transacion_address(i)).unwrap();
+                println!(
+                    "[COORDINADOR {}] Enviando INFO a la cafetería {}",
+                    self.id, i
+                );
+                socket
+                    .send_to(&buffer, Self::transacion_address(i))
+                    .unwrap();
             }
         }
     }
@@ -169,7 +261,9 @@ impl Cafeteria {
         let mut i = size_of::<usize>() + 1;
 
         for _ in 0..n {
-            ids.push(usize::from_le_bytes(buf[i..(size_of::<usize>() + i)].try_into().unwrap()));
+            ids.push(usize::from_le_bytes(
+                buf[i..(size_of::<usize>() + i)].try_into().unwrap(),
+            ));
             i += size_of::<usize>();
         }
 
@@ -191,7 +285,10 @@ impl Cafeteria {
                     self.ack.1.notify_all();
                 }
                 b'E' => {
-                    println!("Nodo {} recibi ELECTION de {} contenido {:?}", self.id, id_sender, ids);
+                    println!(
+                        "Nodo {} recibi ELECTION de {} contenido {:?}",
+                        self.id, id_sender, ids
+                    );
                     self.socket
                         .send_to(&self.construir_paquete(b'A', &[self.id]), id_sender)
                         .unwrap();
@@ -200,19 +297,22 @@ impl Cafeteria {
                         *self.coordinador.0.lock().unwrap() = Some(nuevo_coordinador);
                         self.coordinador.1.notify_all();
                         let paquete = self.construir_paquete(b'C', &[nuevo_coordinador, self.id]);
-                        
+
                         let clone = self.clone();
                         thread::spawn(move || clone.enviar_al_siguiente(&paquete, clone.id));
                     } else {
                         ids.push(self.id);
                         let paquete = self.construir_paquete(b'E', &ids);
-                        
+
                         let clone = self.clone();
                         thread::spawn(move || clone.enviar_al_siguiente(&paquete, clone.id));
                     }
                 }
                 b'C' => {
-                    println!("Nodo {} recibi COORDINATOR de {} contenido {:?}", self.id, id_sender, ids);
+                    println!(
+                        "Nodo {} recibi COORDINATOR de {} contenido {:?}",
+                        self.id, id_sender, ids
+                    );
                     *self.coordinador.0.lock().unwrap() = Some(ids[0]);
                     self.coordinador.1.notify_all();
                     self.socket
@@ -225,7 +325,11 @@ impl Cafeteria {
                         let clone = self.clone();
                         thread::spawn(move || clone.enviar_al_siguiente(&paquete, clone.id));
                     }
-                    println!("Nodo {} -  Nuevo lider {}", self.id, self.coordinador.0.lock().unwrap().unwrap());
+                    println!(
+                        "Nodo {} -  Nuevo lider {}",
+                        self.id,
+                        self.coordinador.0.lock().unwrap().unwrap()
+                    );
                 }
                 _ => {
                     // Unknown
@@ -240,31 +344,37 @@ impl Cafeteria {
             // offline -> manejar
         }
         *self.ack.0.lock().unwrap() = None;
-        self.socket.send_to(paquete, Self::election_address(siguiente));
-        let ack = self.ack.1.wait_timeout_while(
-            self.ack.0.lock().unwrap(),
-            TIMEOUT,
-            |ack| ack.is_none() || ack.unwrap() != siguiente,
-        );
+        self.socket
+            .send_to(paquete, Self::election_address(siguiente)).unwrap();
+        let ack = self
+            .ack
+            .1
+            .wait_timeout_while(self.ack.0.lock().unwrap(), TIMEOUT, |ack| {
+                ack.is_none() || ack.unwrap() != siguiente
+            });
         if ack.unwrap().1.timed_out() {
             self.enviar_al_siguiente(paquete, siguiente)
         }
     }
 
     fn obtener_coordinador(&self) -> usize {
-        self.coordinador.1.wait_while(
-            self.coordinador.0.lock().unwrap(),
-            |coordinador| coordinador.is_none(),
-        ).unwrap().unwrap()
+        self.coordinador
+            .1
+            .wait_while(self.coordinador.0.lock().unwrap(), |coordinador| {
+                coordinador.is_none()
+            })
+            .unwrap()
+            .unwrap()
     }
 
     fn empezar_eleccion(&mut self) {
         println!("[INFO] Nodo {} empezando eleccion", self.id);
 
         self.enviar_al_siguiente(&self.construir_paquete(b'E', &[self.id]), self.id);
-        self.coordinador.1.wait_while(
-            self.coordinador.0.lock().unwrap(),
-            |coordinador| coordinador.is_none(),
-        );
+        self.coordinador
+            .1
+            .wait_while(self.coordinador.0.lock().unwrap(), |coordinador| {
+                coordinador.is_none()
+            });
     }
 }
