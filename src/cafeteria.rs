@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
-use std::io::BufRead;
 use std::mem::size_of;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,13 +7,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::constantes::{CANT_CAFETERAS, CANT_CAFETERIAS, TIEMPO_PEDIDO, TIMEOUT};
+use crate::constantes::{CANT_CAFETERAS, CANT_CAFETERIAS, TIMEOUT};
 use crate::direcciones::{address_data, address_eleccion};
 use crate::mensajes::{
     ACK, INFO, SUMAR_PUNTOS, PREPARE_RESTAR_PUNTOS, COMMIT_RESTAR_PUNTOS, OK, ABORT,
     ELECTION, COORDINATOR, EstadoTransaccion
 };
-use crate::pedido::Pedido;
+use crate::pedido::{Pedido, Pedidos, leer_pedidos};
 
 pub struct Cafeteria {
     id: usize,
@@ -23,7 +22,7 @@ pub struct Cafeteria {
     ack: Arc<(Mutex<Option<usize>>, Condvar)>,
     socket: UdpSocket,
     cuentas: Arc<Mutex<HashMap<u32, i32>>>,
-    pedidos: Arc<(Mutex<VecDeque<Pedido>>, Condvar)>,
+    pedidos: Pedidos,
     sumas_pendientes: Arc<(Mutex<Vec<[u8; 8]>>, Condvar)>,
     termino: Arc<AtomicBool>,
     en_linea: Arc<AtomicBool>
@@ -45,7 +44,7 @@ impl Cafeteria {
         }
     }
 
-    fn clone(&self) -> Cafeteria {
+    pub fn clone(&self) -> Cafeteria {
         Cafeteria {
             id: self.id,
             coordinador: self.coordinador.clone(),
@@ -62,11 +61,10 @@ impl Cafeteria {
 
     pub fn run(&mut self) {
         let mut handles = Vec::new();
-        let file = std::fs::File::open(&self.pedidos_path).unwrap();
-        let reader = std::io::BufReader::new(file);
         let pedidos_clone = self.pedidos.clone();
+        let path = self.pedidos_path.clone();
         handles.push(thread::spawn(move || {
-            Self::leer_pedidos(reader, pedidos_clone)
+            leer_pedidos(&path, &pedidos_clone)
         }));
 
         let socket = UdpSocket::bind(address_data(self.id)).unwrap();
@@ -104,22 +102,6 @@ impl Cafeteria {
 
         for handle in handles {
             handle.join().unwrap();
-        }
-    }
-
-    fn leer_pedidos(
-        reader: std::io::BufReader<std::fs::File>,
-        pedidos: Arc<(Mutex<VecDeque<Pedido>>, Condvar)>,
-    ) {
-        for (id_pedido, line) in reader.lines().enumerate() {
-            let line = line.unwrap();
-            let mut split = line.split(';');
-            let id_cuenta = split.next().unwrap().parse::<u32>().unwrap();
-            let puntos = split.next().unwrap().parse::<i32>().unwrap();
-            let pedido = Pedido { id: id_pedido, cuenta: id_cuenta, puntos };
-            pedidos.0.lock().unwrap().push_back(pedido);
-            pedidos.1.notify_one();
-            thread::sleep(Duration::from_secs(TIEMPO_PEDIDO));
         }
     }
 
