@@ -9,9 +9,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::constantes::{ACK, CANT_CAFETERAS, CANT_CAFETERIAS, INFO, SUMAR_PUNTOS, TIEMPO_PEDIDO, PREPARE_RESTAR_PUNTOS, COMMIT_RESTAR_PUNTOS, OK, ABORT};
-
-pub const TIMEOUT: Duration = Duration::from_secs(5);
+use crate::constantes::{CANT_CAFETERAS, CANT_CAFETERIAS, TIEMPO_PEDIDO, TIMEOUT};
+use crate::mensajes::{ACK, INFO, SUMAR_PUNTOS, PREPARE_RESTAR_PUNTOS, COMMIT_RESTAR_PUNTOS, OK, ABORT, ELECTION, COORDINATOR};
 
 #[derive(Debug)]
 pub struct Pedido {
@@ -456,12 +455,12 @@ impl Cafeteria {
             let mut ids = self.obtener_ids_paquete(&buf);
 
             match accion {
-                b'A' => {
+                ACK => {
                     println!("Nodo {} Recibi ACK de {}", self.id, id_sender);
                     *self.ack.0.lock().unwrap() = Some(ids[0]);
                     self.ack.1.notify_all();
                 }
-                b'E' => {
+                ELECTION => {
                     println!(
                         "Nodo {} recibi ELECTION de {} contenido {:?}",
                         self.id, id_sender, ids
@@ -485,9 +484,9 @@ impl Cafeteria {
                         thread::spawn(move || clone.enviar_al_siguiente(&paquete, clone.id));
                     }
                 }
-                b'C' => {
+                COORDINATOR => {
                     println!(
-                        "Nodo {} recibi COORDINATOR de {} contenido {:?}",
+                        "[Nodo {}] recibi COORDINATOR de {} contenido {:?}",
                         self.id, id_sender, ids
                     );
                     *self.coordinador.0.lock().unwrap() = Some(ids[0]);
@@ -503,13 +502,13 @@ impl Cafeteria {
                         thread::spawn(move || clone.enviar_al_siguiente(&paquete, clone.id));
                     }
                     println!(
-                        "Nodo {} -  Nuevo lider {}",
+                        "[Nodo {}] Nuevo lider {}",
                         self.id,
                         self.coordinador.0.lock().unwrap().unwrap()
                     );
                 }
                 _ => {
-                    // Unknown
+                    println!("[Nodo {}] Recibi accion desconocida {}", self.id, accion);
                 }
             }
         }
