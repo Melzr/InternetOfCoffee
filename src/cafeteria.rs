@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
-use std::io::{BufRead};
+use std::io::BufRead;
 use std::mem::size_of;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
@@ -15,12 +15,12 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct Pedido {
-    pub id: u32,
+    pub id: usize,
     pub cuenta: u32,
     pub puntos: i32
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum EstadoTransaccion {
     Ok,
     Abort
@@ -34,7 +34,7 @@ pub struct Cafeteria {
     socket: UdpSocket,
     termino: Arc<AtomicBool>,
     cuentas: Arc<Mutex<HashMap<u32, i32>>>,
-    pedidos: Arc<(Mutex<Vec<Pedido>>, Condvar)>,
+    pedidos: Arc<(Mutex<VecDeque<Pedido>>, Condvar)>,
     sumas_pendientes: Arc<(Mutex<Vec<[u8; 8]>>, Condvar)>,
     en_linea: Arc<AtomicBool>
 }
@@ -49,7 +49,7 @@ impl Cafeteria {
             socket: UdpSocket::bind(Self::election_address(id)).unwrap(),
             termino: Arc::new(AtomicBool::new(false)),
             cuentas: Arc::new(Mutex::new(HashMap::new())),
-            pedidos: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
+            pedidos: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
             sumas_pendientes: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
             en_linea: Arc::new(AtomicBool::new(true))
         }
@@ -110,16 +110,14 @@ impl Cafeteria {
         let clone = self.clone();
         let ack2 = ack.clone();
         let socket_clone = socket.try_clone().unwrap();
-        let transacciones_clone = transacciones.clone();
         handles.push(thread::spawn(move || {
-            clone.recibir_mensajes(&socket_clone, ack2, transacciones_clone)
+            clone.recibir_mensajes(&socket_clone, ack2, transacciones)
         }));
 
         let socket_clone = socket.try_clone().unwrap();
-        let ack_clone = ack.clone();
         let mut clone = self.clone();
         handles.push(thread::spawn(move ||
-            Self::esperar_acks_pedidos(&ack_clone, &socket_clone, &mut clone)
+            Self::esperar_acks_pedidos(&ack, &socket_clone, &mut clone)
         ));
 
         for handle in handles {
@@ -129,17 +127,15 @@ impl Cafeteria {
 
     fn leer_pedidos(
         reader: std::io::BufReader<std::fs::File>,
-        pedidos: Arc<(Mutex<Vec<Pedido>>, Condvar)>,
+        pedidos: Arc<(Mutex<VecDeque<Pedido>>, Condvar)>,
     ) {
-        let mut id_pedido = 0;
-        for line in reader.lines() {
+        for (id_pedido, line) in reader.lines().enumerate() {
             let line = line.unwrap();
             let mut split = line.split(';');
             let id_cuenta = split.next().unwrap().parse::<u32>().unwrap();
             let puntos = split.next().unwrap().parse::<i32>().unwrap();
             let pedido = Pedido { id: id_pedido, cuenta: id_cuenta, puntos };
-            id_pedido += 1;
-            pedidos.0.lock().unwrap().push(pedido);
+            pedidos.0.lock().unwrap().push_back(pedido);
             pedidos.1.notify_one();
             thread::sleep(Duration::from_secs(TIEMPO_PEDIDO));
         }
@@ -154,9 +150,9 @@ impl Cafeteria {
                 puntos: 0,
             };
             if let Ok(mut state) = cvar.wait_while(lock.lock().unwrap(), |pedidos_data| {
-                !(pedidos_data.first().is_some())
+                pedidos_data.is_empty()
             }) {
-                pedido = state.pop().unwrap();
+                pedido = state.pop_front().unwrap();
             }
             if pedido.puntos > 0 {
                 thread::sleep(Duration::from_secs(10));
@@ -194,7 +190,7 @@ impl Cafeteria {
                     let (lock, cvar) = &*(transacciones);
                     let mut transaccion = None;
                     if let Ok(mut state) = cvar.wait_while(lock.lock().unwrap(), |transacciones_data| {
-                        !(transacciones_data.get(&id).is_some())
+                        transacciones_data.get(&id).is_none()
                     }) {
                         transaccion = state.remove(&id).unwrap();
                     }
@@ -275,7 +271,7 @@ impl Cafeteria {
         loop {
             buffer = [0; 8];
             let response = socket.recv_from(&mut buffer);
-            if response.is_ok() {
+            if let Ok(resp) = response {
                 if !self.en_linea.load(Ordering::Relaxed) {
                     // pedir info a nodo siguiente
                     
@@ -321,7 +317,7 @@ impl Cafeteria {
                             socket
                                 .send_to(&[ACK, buffer[1], buffer[2], 0, 0, 0, 0, 0], response.unwrap().1)
                                 .unwrap();
-                            self.broadcast_info(&socket, cuenta, *puntos_actuales);
+                            self.broadcast_info(socket, cuenta, *puntos_actuales);
                         }
                     }
                     PREPARE_RESTAR_PUNTOS => {
@@ -345,11 +341,11 @@ impl Cafeteria {
                             if (*puntos_actuales - puntos_bloqueados) >= puntos {
                                 restas_pendientes.insert(id, (cuenta as u32, puntos));
                                 socket
-                                    .send_to(&[OK, buffer[1], buffer[2], 0, 0, 0, 0, 0], response.unwrap().1)
+                                    .send_to(&[OK, buffer[1], buffer[2], 0, 0, 0, 0, 0], resp.1)
                                     .unwrap();
                             } else {
                                 socket
-                                    .send_to(&[ABORT, buffer[1], buffer[2], 0, 0, 0, 0, 0], response.unwrap().1)
+                                    .send_to(&[ABORT, buffer[1], buffer[2], 0, 0, 0, 0, 0], resp.1)
                                     .unwrap();
                             }
                         }
@@ -370,7 +366,7 @@ impl Cafeteria {
                                 "[COORDINADOR {}] Puntos nuevos de la cuenta {}: {}",
                                 self.id, cuenta, puntos_actuales
                             );
-                            self.broadcast_info(&socket, cuenta as u8, *puntos_actuales);
+                            self.broadcast_info(socket, cuenta as u8, *puntos_actuales);
                         }
                     }
                     OK => {
@@ -554,10 +550,8 @@ impl Cafeteria {
         println!("[INFO] Nodo {} empezando eleccion", self.id);
 
         self.enviar_al_siguiente(&self.construir_paquete(b'E', &[self.id]), self.id);
-        self.coordinador
-            .1
-            .wait_while(self.coordinador.0.lock().unwrap(), |coordinador| {
-                coordinador.is_none()
-            });
+        self.coordinador.1.wait_while(self.coordinador.0.lock().unwrap(), |coordinador| {
+            coordinador.is_none()
+        });
     }
 }
