@@ -2,7 +2,6 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
 use std::io::BufRead;
 use std::mem::size_of;
-use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -10,20 +9,12 @@ use std::thread;
 use std::time::Duration;
 
 use crate::constantes::{CANT_CAFETERAS, CANT_CAFETERIAS, TIEMPO_PEDIDO, TIMEOUT};
-use crate::mensajes::{ACK, INFO, SUMAR_PUNTOS, PREPARE_RESTAR_PUNTOS, COMMIT_RESTAR_PUNTOS, OK, ABORT, ELECTION, COORDINATOR};
-
-#[derive(Debug)]
-pub struct Pedido {
-    pub id: usize,
-    pub cuenta: u32,
-    pub puntos: i32
-}
-
-#[derive(PartialEq, Eq)]
-pub enum EstadoTransaccion {
-    Ok,
-    Abort
-}
+use crate::direcciones::{address_data, address_eleccion};
+use crate::mensajes::{
+    ACK, INFO, SUMAR_PUNTOS, PREPARE_RESTAR_PUNTOS, COMMIT_RESTAR_PUNTOS, OK, ABORT,
+    ELECTION, COORDINATOR, EstadoTransaccion
+};
+use crate::pedido::Pedido;
 
 pub struct Cafeteria {
     id: usize,
@@ -31,10 +22,10 @@ pub struct Cafeteria {
     coordinador: Arc<(Mutex<Option<usize>>, Condvar)>,
     ack: Arc<(Mutex<Option<usize>>, Condvar)>,
     socket: UdpSocket,
-    termino: Arc<AtomicBool>,
     cuentas: Arc<Mutex<HashMap<u32, i32>>>,
     pedidos: Arc<(Mutex<VecDeque<Pedido>>, Condvar)>,
     sumas_pendientes: Arc<(Mutex<Vec<[u8; 8]>>, Condvar)>,
+    termino: Arc<AtomicBool>,
     en_linea: Arc<AtomicBool>
 }
 
@@ -45,7 +36,7 @@ impl Cafeteria {
             pedidos_path,
             coordinador: Arc::new((Mutex::new(None), Condvar::new())),
             ack: Arc::new((Mutex::new(None), Condvar::new())),
-            socket: UdpSocket::bind(Self::election_address(id)).unwrap(),
+            socket: UdpSocket::bind(address_eleccion(id)).unwrap(),
             termino: Arc::new(AtomicBool::new(false)),
             cuentas: Arc::new(Mutex::new(HashMap::new())),
             pedidos: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
@@ -69,14 +60,6 @@ impl Cafeteria {
         }
     }
 
-    pub fn election_address(id: usize) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], (8000 + id) as u16))
-    }
-
-    pub fn transacion_address(id: usize) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], (9000 + id) as u16))
-    }
-
     pub fn run(&mut self) {
         let mut handles = Vec::new();
         let file = std::fs::File::open(&self.pedidos_path).unwrap();
@@ -86,7 +69,7 @@ impl Cafeteria {
             Self::leer_pedidos(reader, pedidos_clone)
         }));
 
-        let socket = UdpSocket::bind(Self::transacion_address(self.id)).unwrap();
+        let socket = UdpSocket::bind(address_data(self.id)).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
@@ -183,7 +166,7 @@ impl Cafeteria {
                         puntos_bytes[2],
                         puntos_bytes[3],
                     ];
-                    data_socket.send_to(&buffer, Self::transacion_address(coordinador)).unwrap();
+                    data_socket.send_to(&buffer, address_data(coordinador)).unwrap();
                     let id = u16::from_be_bytes([cafeteria.id as u8, pedido.id as u8]);
 
                     let (lock, cvar) = &*(transacciones);
@@ -208,7 +191,7 @@ impl Cafeteria {
                             0,
                         ];
                         if transaccion == EstadoTransaccion::Ok {
-                            data_socket.send_to(&buffer, Self::transacion_address(coordinador)).unwrap();
+                            data_socket.send_to(&buffer, address_data(coordinador)).unwrap();
                         } else {
                             println!("[NODO {}] Transaccion abortada", cafeteria.id);
                         }
@@ -232,7 +215,7 @@ impl Cafeteria {
                 socket
                 .send_to(
                     buffer,
-                    Self::transacion_address(cafeteria.obtener_coordinador()),
+                    address_data(cafeteria.obtener_coordinador()),
                 )
                 .unwrap();
             }
@@ -279,7 +262,7 @@ impl Cafeteria {
                     // buffer[1] = self.id as u8;
                     // buffer[2] = self.id as u8;
                     // buffer[3] = self.id as u8;
-                    // socket.send_to(&buffer, Self::transacion_address(self.siguiente)).unwrap();
+                    // socket.send_to(&buffer, address_data(self.siguiente)).unwrap();
 
                     // clear de cuentas
                     // esperar un INFO_ACK, sino contesta mandarle al siguiente
@@ -416,7 +399,7 @@ impl Cafeteria {
                     self.id, i
                 );
                 socket
-                    .send_to(&buffer, Self::transacion_address(i))
+                    .send_to(&buffer, address_data(i))
                     .unwrap();
             }
         }
@@ -523,7 +506,7 @@ impl Cafeteria {
         }
         *self.ack.0.lock().unwrap() = None;
         self.socket
-            .send_to(paquete, Self::election_address(siguiente)).unwrap();
+            .send_to(paquete, address_eleccion(siguiente)).unwrap();
         let ack = self
             .ack
             .1

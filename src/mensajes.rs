@@ -7,3 +7,9 @@ pub const COMMIT_RESTAR_PUNTOS: u8 = b'C';
 pub const INFO: u8 = b'I';
 pub const ELECTION: u8 = b'E';
 pub const COORDINATOR: u8 = b'C';
+
+#[derive(PartialEq, Eq)]
+pub enum EstadoTransaccion {
+    Ok,
+    Abort
+}
