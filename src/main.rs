@@ -1,7 +1,7 @@
 use std::thread;
 
 use coffeewards::cafeteria::Cafeteria;
-use coffeewards::constants::CANT_CAFETERIAS;
+use coffeewards::constantes::CANT_CAFETERIAS;
 
 fn main() {
     let mut node_threads = vec![];
