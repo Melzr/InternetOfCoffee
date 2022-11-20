@@ -81,7 +81,8 @@ impl Cafeteria {
 
         let mut clone = self.clone();
         handles.push(thread::spawn(move || clone.responder()));
-        self.empezar_eleccion();
+        self.pedir_info(&data_socket, (self.id + 1) % CANT_CAFETERIAS);
+
         let clone = self.clone();
         let data_ack_clone = data_ack.clone();
         let socket_clone = data_socket.try_clone().unwrap();
@@ -314,6 +315,7 @@ impl Cafeteria {
             let response = socket.recv_from(&mut buffer);
             if response.is_ok() {
                 if buffer[0] == INFO_ACK {
+                    println!("[NODO {}] Recibido INFO_ACK", self.id);
                     self.en_linea.store(true, Ordering::Relaxed);
                     let mut clone = self.clone();
                     thread::spawn(move || clone.empezar_eleccion());
@@ -326,9 +328,14 @@ impl Cafeteria {
                     for (cuenta, puntos) in cuentas.iter() {
                         println!("[NODO {}] Cuenta {}: {}", self.id, cuenta, puntos);
                     }
+                } else if buffer[0] == PEDIR_INFO && self.en_linea.load(Ordering::Relaxed) {
+                    println!("[NODO {}] Enviando info", self.id);
+                    socket.send_to(&[INFO_ACK, 0,0,0,0,0,0,0], response.unwrap().1).unwrap();
                 }
             } else {
+                println!("[NODO {}] No se pudo conectar con el nodo {}", self.id, id);
                 self.pedir_info(socket, (id + 1) % CANT_CAFETERAS);
+                recibio_ack = true;
             }
         }
     }
