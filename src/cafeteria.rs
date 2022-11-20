@@ -1,30 +1,29 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::mem::size_of;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 
-use crate::constantes::{CANT_CAFETERAS, CANT_CAFETERIAS, TIMEOUT};
+use crate::constantes::{CANT_CAFETERAS, CANT_CAFETERIAS, TIMEOUT, TIEMPO_PREPARACION_PEDIDO};
 use crate::direcciones::{address_data, address_eleccion};
 use crate::mensajes::{
     ACK, INFO, SUMAR_PUNTOS, PREPARE_RESTAR_PUNTOS, COMMIT_RESTAR_PUNTOS, OK, ABORT,
     ELECTION, COORDINATOR, EstadoTransaccion
 };
-use crate::pedido::{Pedido, Pedidos, leer_pedidos};
+use crate::pedido::{Pedido, Pedidos, leer_pedidos, PedidosInfo};
 
 pub struct Cafeteria {
     id: usize,
     pedidos_path: String,
     coordinador: Arc<(Mutex<Option<usize>>, Condvar)>,
-    ack: Arc<(Mutex<Option<usize>>, Condvar)>,
-    socket: UdpSocket,
+    election_ack: Arc<(Mutex<Option<usize>>, Condvar)>,
+    election_socket: UdpSocket,
     cuentas: Arc<Mutex<HashMap<u32, i32>>>,
     pedidos: Pedidos,
     sumas_pendientes: Arc<(Mutex<Vec<[u8; 8]>>, Condvar)>,
-    termino: Arc<AtomicBool>,
+    fin: Arc<AtomicBool>,
     en_linea: Arc<AtomicBool>
 }
 
@@ -34,12 +33,12 @@ impl Cafeteria {
             id,
             pedidos_path,
             coordinador: Arc::new((Mutex::new(None), Condvar::new())),
-            ack: Arc::new((Mutex::new(None), Condvar::new())),
-            socket: UdpSocket::bind(address_eleccion(id)).unwrap(),
-            termino: Arc::new(AtomicBool::new(false)),
+            election_ack: Arc::new((Mutex::new(None), Condvar::new())),
+            election_socket: UdpSocket::bind(address_eleccion(id)).unwrap(),
             cuentas: Arc::new(Mutex::new(HashMap::new())),
-            pedidos: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
+            pedidos: Arc::new((Mutex::new(PedidosInfo::new()), Condvar::new())),
             sumas_pendientes: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
+            fin: Arc::new(AtomicBool::new(false)),
             en_linea: Arc::new(AtomicBool::new(true))
         }
     }
@@ -47,38 +46,34 @@ impl Cafeteria {
     pub fn clone(&self) -> Cafeteria {
         Cafeteria {
             id: self.id,
-            coordinador: self.coordinador.clone(),
-            ack: self.ack.clone(),
-            socket: self.socket.try_clone().unwrap(),
-            termino: self.termino.clone(),
-            cuentas: self.cuentas.clone(),
             pedidos_path: self.pedidos_path.clone(),
+            coordinador: self.coordinador.clone(),
+            election_ack: self.election_ack.clone(),
+            election_socket: self.election_socket.try_clone().unwrap(),
+            cuentas: self.cuentas.clone(),
             pedidos: self.pedidos.clone(),
             sumas_pendientes: self.sumas_pendientes.clone(),
+            fin: self.fin.clone(),
             en_linea: self.en_linea.clone()
         }
     }
 
     pub fn run(&mut self) {
         let mut handles = Vec::new();
-        let pedidos_clone = self.pedidos.clone();
-        let path = self.pedidos_path.clone();
-        handles.push(thread::spawn(move || {
-            leer_pedidos(&path, &pedidos_clone)
-        }));
-
-        let socket = UdpSocket::bind(address_data(self.id)).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(1)))
+        let file = std::fs::File::open(&self.pedidos_path).unwrap();
+        let reader = std::io::BufReader::new(file);
+        let data_socket = UdpSocket::bind(address_data(self.id)).unwrap();
+        data_socket
+            .set_read_timeout(Some(TIMEOUT))
             .unwrap();
 
-        let ack = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let data_ack = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
         let transacciones: Arc<(Mutex<HashMap<u16, Option<EstadoTransaccion>>>, Condvar)> = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
 
         for _ in 0..CANT_CAFETERAS {
             let mut clone = self.clone();
             let transacciones_clone = transacciones.clone();
-            let socket_clone = socket.try_clone().unwrap();
+            let socket_clone = data_socket.try_clone().unwrap();
             handles.push(thread::spawn(move || {
                 Self::cafetera(&mut clone, transacciones_clone, &socket_clone);
             }));
@@ -88,101 +83,24 @@ impl Cafeteria {
         handles.push(thread::spawn(move || clone.responder()));
         self.empezar_eleccion();
         let clone = self.clone();
-        let ack2 = ack.clone();
-        let socket_clone = socket.try_clone().unwrap();
+        let data_ack_clone = data_ack.clone();
+        let socket_clone = data_socket.try_clone().unwrap();
         handles.push(thread::spawn(move || {
-            clone.recibir_mensajes(&socket_clone, ack2, transacciones)
+            clone.recibir_mensajes(&socket_clone, data_ack_clone, transacciones)
         }));
 
-        let socket_clone = socket.try_clone().unwrap();
+        let socket_clone = data_socket.try_clone().unwrap();
         let mut clone = self.clone();
         handles.push(thread::spawn(move ||
-            Self::esperar_acks_pedidos(&ack, &socket_clone, &mut clone)
+            Self::esperar_acks_pedidos(&data_ack, &socket_clone, &mut clone)
         ));
 
+        leer_pedidos(reader, &self.pedidos);
+        self.fin.store(true, Ordering::Relaxed);
+
         for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    pub fn cafetera(cafeteria: &mut Cafeteria, transacciones: Arc<(Mutex<HashMap<u16, Option<EstadoTransaccion>>>, Condvar)>, data_socket: &UdpSocket) {
-        loop {
-            let (lock, cvar) = &*(cafeteria.pedidos);
-            let mut pedido = Pedido {
-                id: 0,
-                cuenta: 0,
-                puntos: 0,
-            };
-            if let Ok(mut state) = cvar.wait_while(lock.lock().unwrap(), |pedidos_data| {
-                pedidos_data.is_empty()
-            }) {
-                pedido = state.pop_front().unwrap();
-            }
-            if pedido.puntos > 0 {
-                thread::sleep(Duration::from_secs(10));
-                println!("Cafetera: Pedido listo {:?}", pedido);
-                let puntos_bytes: [u8; 4] = pedido.puntos.to_be_bytes();
-                let buffer = [
-                    SUMAR_PUNTOS,
-                    cafeteria.id as u8,
-                    pedido.id as u8,
-                    pedido.cuenta as u8,
-                    puntos_bytes[0],
-                    puntos_bytes[1],
-                    puntos_bytes[2],
-                    puntos_bytes[3],
-                ];
-                cafeteria.sumas_pendientes.0.lock().unwrap().push(buffer);
-                cafeteria.sumas_pendientes.1.notify_all();
-            } else {
-                let coordinador = cafeteria.obtener_coordinador();
-                if cafeteria.en_linea.load(Ordering::SeqCst) {
-                    let puntos_bytes: [u8; 4] = (pedido.puntos).abs().to_be_bytes();
-                    let buffer = [
-                        PREPARE_RESTAR_PUNTOS,
-                        cafeteria.id as u8,
-                        pedido.id as u8,
-                        pedido.cuenta as u8,
-                        puntos_bytes[0],
-                        puntos_bytes[1],
-                        puntos_bytes[2],
-                        puntos_bytes[3],
-                    ];
-                    data_socket.send_to(&buffer, address_data(coordinador)).unwrap();
-                    let id = u16::from_be_bytes([cafeteria.id as u8, pedido.id as u8]);
-
-                    let (lock, cvar) = &*(transacciones);
-                    let mut transaccion = None;
-                    if let Ok(mut state) = cvar.wait_while(lock.lock().unwrap(), |transacciones_data| {
-                        transacciones_data.get(&id).is_none()
-                    }) {
-                        transaccion = state.remove(&id).unwrap();
-                    }
-
-                    let transaccion = transaccion.unwrap();
-                    if transaccion == EstadoTransaccion::Ok {
-                        thread::sleep(Duration::from_secs(10));
-                        let buffer = [
-                            COMMIT_RESTAR_PUNTOS,
-                            cafeteria.id as u8,
-                            pedido.id as u8,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                        ];
-                        if transaccion == EstadoTransaccion::Ok {
-                            data_socket.send_to(&buffer, address_data(coordinador)).unwrap();
-                        } else {
-                            println!("[NODO {}] Transaccion abortada", cafeteria.id);
-                        }
-                    } else {
-                        println!("[NODO {}] Transaccion abortada", cafeteria.id);
-                    }
-                } else {
-                    println!("[NODO {}] no esta en linea, no se pueden restar puntos", cafeteria.id);
-                }
+            if handle.join().is_err() {
+                println!("[WARN] Error en el join de un thread");
             }
         }
     }
@@ -412,25 +330,25 @@ impl Cafeteria {
     }
 
     fn responder(&mut self) {
-        while !self.termino.load(Ordering::SeqCst) {
+        while !self.fin.load(Ordering::Relaxed) {
             let mut buf = [0; 1 + size_of::<usize>() + (CANT_CAFETERIAS + 1) * size_of::<usize>()];
             // self.socket.set_read_timeout(Some(TIMEOUT / 4)).unwrap();
-            let (_, id_sender) = self.socket.recv_from(&mut buf).unwrap();
+            let (_, id_sender) = self.election_socket.recv_from(&mut buf).unwrap();
             let accion = buf[0];
             let mut ids = self.obtener_ids_paquete(&buf);
 
             match accion {
                 ACK => {
                     println!("Nodo {} Recibi ACK de {}", self.id, id_sender);
-                    *self.ack.0.lock().unwrap() = Some(ids[0]);
-                    self.ack.1.notify_all();
+                    *self.election_ack.0.lock().unwrap() = Some(ids[0]);
+                    self.election_ack.1.notify_all();
                 }
                 ELECTION => {
                     println!(
                         "Nodo {} recibi ELECTION de {} contenido {:?}",
                         self.id, id_sender, ids
                     );
-                    self.socket
+                    self.election_socket
                         .send_to(&self.construir_paquete(b'A', &[self.id]), id_sender)
                         .unwrap();
                     if ids.contains(&self.id) {
@@ -456,7 +374,7 @@ impl Cafeteria {
                     );
                     *self.coordinador.0.lock().unwrap() = Some(ids[0]);
                     self.coordinador.1.notify_all();
-                    self.socket
+                    self.election_socket
                         .send_to(&self.construir_paquete(b'A', &[self.id]), id_sender)
                         .unwrap();
                     if !ids[1..].contains(&self.id) {
@@ -486,13 +404,13 @@ impl Cafeteria {
             self.en_linea.store(false, Ordering::Relaxed);
             *self.coordinador.0.lock().unwrap() = Some(self.id);
         }
-        *self.ack.0.lock().unwrap() = None;
-        self.socket
+        *self.election_ack.0.lock().unwrap() = None;
+        self.election_socket
             .send_to(paquete, address_eleccion(siguiente)).unwrap();
         let ack = self
-            .ack
+            .election_ack
             .1
-            .wait_timeout_while(self.ack.0.lock().unwrap(), TIMEOUT, |ack| {
+            .wait_timeout_while(self.election_ack.0.lock().unwrap(), TIMEOUT, |ack| {
                 ack.is_none() || ack.unwrap() != siguiente
             });
         if ack.unwrap().1.timed_out() {
@@ -517,5 +435,90 @@ impl Cafeteria {
         self.coordinador.1.wait_while(self.coordinador.0.lock().unwrap(), |coordinador| {
             coordinador.is_none()
         });
+    }
+
+    pub fn cafetera(cafeteria: &mut Cafeteria, transacciones: Arc<(Mutex<HashMap<u16, Option<EstadoTransaccion>>>, Condvar)>, data_socket: &UdpSocket) {
+        loop {
+            let (lock, cvar) = &*(cafeteria.pedidos);
+            let mut pedido = Pedido {
+                id: 0,
+                cuenta: 0,
+                puntos: 0,
+            };
+            if let Ok(mut state) = cvar.wait_while(lock.lock().unwrap(), |pedidos| {
+                pedidos.cola_pedidos.is_empty() && !pedidos.fin
+            }) {
+                if state.fin {
+                    break;
+                }
+                pedido = state.cola_pedidos.pop_front().unwrap();
+            }
+            if pedido.puntos > 0 {
+                thread::sleep(TIEMPO_PREPARACION_PEDIDO);
+                println!("[NODO {}] pedido con id {} preparado", cafeteria.id, pedido.id);
+                let puntos_bytes: [u8; 4] = pedido.puntos.to_be_bytes();
+                let buffer = [
+                    SUMAR_PUNTOS,
+                    cafeteria.id as u8,
+                    pedido.id as u8,
+                    pedido.cuenta as u8,
+                    puntos_bytes[0],
+                    puntos_bytes[1],
+                    puntos_bytes[2],
+                    puntos_bytes[3],
+                ];
+                cafeteria.sumas_pendientes.0.lock().unwrap().push(buffer);
+                cafeteria.sumas_pendientes.1.notify_all();
+            } else {
+                let coordinador = cafeteria.obtener_coordinador();
+                if cafeteria.en_linea.load(Ordering::SeqCst) {
+                    let puntos_bytes: [u8; 4] = (pedido.puntos).abs().to_be_bytes();
+                    let buffer = [
+                        PREPARE_RESTAR_PUNTOS,
+                        cafeteria.id as u8,
+                        pedido.id as u8,
+                        pedido.cuenta as u8,
+                        puntos_bytes[0],
+                        puntos_bytes[1],
+                        puntos_bytes[2],
+                        puntos_bytes[3],
+                    ];
+                    data_socket.send_to(&buffer, address_data(coordinador)).unwrap();
+                    let id = u16::from_be_bytes([cafeteria.id as u8, pedido.id as u8]);
+
+                    let (lock, cvar) = &*(transacciones);
+                    let mut transaccion = None;
+                    if let Ok(mut state) = cvar.wait_while(lock.lock().unwrap(), |transacciones_data| {
+                        transacciones_data.get(&id).is_none()
+                    }) {
+                        transaccion = state.remove(&id).unwrap();
+                    }
+
+                    let transaccion = transaccion.unwrap();
+                    if transaccion == EstadoTransaccion::Ok {
+                        thread::sleep(TIEMPO_PREPARACION_PEDIDO);
+                        let buffer = [
+                            COMMIT_RESTAR_PUNTOS,
+                            cafeteria.id as u8,
+                            pedido.id as u8,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ];
+                        if transaccion == EstadoTransaccion::Ok {
+                            data_socket.send_to(&buffer, address_data(coordinador)).unwrap();
+                        } else {
+                            println!("[NODO {}] Transaccion abortada", cafeteria.id);
+                        }
+                    } else {
+                        println!("[NODO {}] Transaccion abortada", cafeteria.id);
+                    }
+                } else {
+                    println!("[NODO {}] no esta en linea, no se pueden restar puntos", cafeteria.id);
+                }
+            }
+        }
     }
 }
