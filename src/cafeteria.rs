@@ -10,7 +10,7 @@ use crate::constantes::{CANT_CAFETERAS, CANT_CAFETERIAS, TIMEOUT, TIEMPO_PREPARA
 use crate::direcciones::{address_data, address_eleccion};
 use crate::mensajes::{
     ACK, INFO, SUMAR_PUNTOS, PREPARE_RESTAR_PUNTOS, COMMIT_RESTAR_PUNTOS, OK, ABORT,
-    ELECTION, COORDINATOR, EstadoTransaccion
+    ELECTION, COORDINATOR, EstadoTransaccion, PEDIR_INFO, INFO_ACK
 };
 use crate::pedido::{Pedido, Pedidos, leer_pedidos, PedidosInfo};
 
@@ -107,41 +107,42 @@ impl Cafeteria {
 
     fn esperar_acks_pedidos(ack: &Arc<(Mutex<HashMap<u16, bool>>, Condvar)>, socket: &UdpSocket, cafeteria: &mut Cafeteria) {
         loop {
-            let (sumas_lock, sumas_cvar) = &*cafeteria.sumas_pendientes;
-            let (ack_lock, ack_cvar) = &**ack;
-            let mut sumas = sumas_cvar.wait_while(sumas_lock.lock().unwrap(), |sumas| sumas.is_empty()).unwrap();
-            for suma in sumas.iter() {
-                let buffer = &*suma;
-                socket
-                .send_to(
-                    buffer,
-                    address_data(cafeteria.obtener_coordinador()),
-                )
-                .unwrap();
-            }
-            let mut ack_resp = ack_cvar
-                .wait_timeout_while(ack_lock.lock().unwrap(), TIMEOUT, |ack| !(ack.iter().any(|(_, v)| *v))).unwrap();
-            if ack_resp.1.timed_out() {
-                drop(sumas);
-                drop(ack_resp);
-                println!("[NODO {}] No se recibió ACK", cafeteria.id);
-                println!(
-                    "[NODO {}] coordinador {} murio",
-                    cafeteria.id,
-                    cafeteria.coordinador.0.lock().unwrap().unwrap()
-                );
-                *(cafeteria.coordinador.0.lock().unwrap()) = None;
-                cafeteria.empezar_eleccion();
-                println!(
-                    "[NODO {}] encontre coordinador {}",
-                    cafeteria.id,
-                    cafeteria.coordinador.0.lock().unwrap().unwrap()
-                );
-            } else {
-                let acks_to_remove: Vec<u16> = ack_resp.0.iter().filter(|(_, v)| **v).map(|(k, _)| *k).collect();
-                for ack in acks_to_remove {
-                    sumas.retain(|s| u16::from_be_bytes([s[1] as u8, s[2] as u8].try_into().unwrap()) != ack);
-                    ack_resp.0.remove(&ack);
+            if cafeteria.en_linea.load(Ordering::Relaxed) {
+                let (sumas_lock, sumas_cvar) = &*cafeteria.sumas_pendientes;
+                let (ack_lock, ack_cvar) = &**ack;
+                let mut sumas = sumas_cvar.wait_while(sumas_lock.lock().unwrap(), |sumas| sumas.is_empty()).unwrap();
+                for suma in sumas.iter() {
+                    let buffer = &*suma;
+                    socket
+                    .send_to(
+                        buffer,
+                        address_data(cafeteria.obtener_coordinador()),
+                    )
+                    .unwrap();
+                }
+                let mut ack_resp = ack_cvar.wait_timeout_while(ack_lock.lock().unwrap(), TIMEOUT, |ack| !(ack.iter().any(|(_, v)| *v))).unwrap();
+                if ack_resp.1.timed_out() {
+                    drop(sumas);
+                    drop(ack_resp);
+                    println!("[NODO {}] No se recibió ACK", cafeteria.id);
+                    println!(
+                        "[NODO {}] coordinador {} murio",
+                        cafeteria.id,
+                        cafeteria.coordinador.0.lock().unwrap().unwrap()
+                    );
+                    *(cafeteria.coordinador.0.lock().unwrap()) = None;
+                    cafeteria.empezar_eleccion();
+                    println!(
+                        "[NODO {}] encontre coordinador {}",
+                        cafeteria.id,
+                        cafeteria.coordinador.0.lock().unwrap().unwrap()
+                    );
+                } else {
+                    let acks_to_remove: Vec<u16> = ack_resp.0.iter().filter(|(_, v)| **v).map(|(k, _)| *k).collect();
+                    for ack in acks_to_remove {
+                        sumas.retain(|s| u16::from_be_bytes([s[1] as u8, s[2] as u8].try_into().unwrap()) != ack);
+                        ack_resp.0.remove(&ack);
+                    }
                 }
             }
         }
@@ -150,132 +151,184 @@ impl Cafeteria {
     fn recibir_mensajes(&self, socket: &UdpSocket, ack: Arc<(Mutex<HashMap<u16, bool>>, Condvar)>, transacciones: Arc<(Mutex<HashMap<u16, Option<EstadoTransaccion>>>, Condvar)>) {
         let mut buffer: [u8; 8];
         let restas_pendientes: Arc<Mutex<HashMap<u16, (u32, i32)>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut transacciones_ack = Vec::new();
         loop {
             buffer = [0; 8];
             let response = socket.recv_from(&mut buffer);
             if let Ok(resp) = response {
                 if !self.en_linea.load(Ordering::Relaxed) {
                     // pedir info a nodo siguiente
-                    
-                    // let mut buffer = [0; 8];
-                    // buffer[0] = PREPARE_PEDIR_INFO;
-                    // buffer[1] = self.id as u8;
-                    // buffer[2] = self.id as u8;
-                    // buffer[3] = self.id as u8;
-                    // socket.send_to(&buffer, address_data(self.siguiente)).unwrap();
-
-                    // clear de cuentas
-                    // esperar un INFO_ACK, sino contesta mandarle al siguiente
-                    
-                    // while (!ack) leemos acks e infos
-
-                    // poner en_linea en true
-                    
-                    // triggerear eleccion (thread)
-                }
-                match buffer[0] {
-                    ACK => {
+                    let next_id = (self.id + 1) % CANT_CAFETERAS;
+                    self.pedir_info(socket, next_id);
+                } else {
+                    match buffer[0] {
+                        ACK => {
                         println!("[NODO {}] ACK recibido", self.id);
                         let id = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
                         let (lock, cvar) = &*ack;
                         lock.lock().unwrap().insert(id, true);
                         cvar.notify_all();
-                    }
-                    SUMAR_PUNTOS => {
-                        if self.obtener_coordinador() == self.id {
-                            let cuenta = buffer[3];
-                            let puntos = i32::from_be_bytes(buffer[4..].try_into().unwrap());
-                            println!(
-                                "[COORDINADOR {}] Sumar {} puntos a la cuenta {}",
-                                self.id, puntos, cuenta
-                            );
-                            let mut cuentas = self.cuentas.lock().unwrap();
-                            let puntos_actuales = cuentas.entry(cuenta as u32).or_insert(0);
-                            *puntos_actuales += puntos as i32;
-                            println!(
-                                "[COORDINADOR {}] Puntos nuevos de la cuenta {}: {}",
-                                self.id, cuenta, puntos_actuales
-                            );
-                            socket
-                                .send_to(&[ACK, buffer[1], buffer[2], 0, 0, 0, 0, 0], response.unwrap().1)
-                                .unwrap();
-                            self.broadcast_info(socket, cuenta, *puntos_actuales);
                         }
-                    }
-                    PREPARE_RESTAR_PUNTOS => {
-                        if self.obtener_coordinador() == self.id {
-                            let id = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
-                            let cuenta = buffer[3];
-                            let puntos = i32::from_be_bytes(buffer[4..].try_into().unwrap());
-                            println!(
-                                "[NODO {}] PREPARE_RESTAR_PUNTOS recibido de {}",
-                                self.id, id
-                            );
-                            let cuentas = self.cuentas.lock().unwrap();
-                            let puntos_actuales = cuentas.get(&(cuenta as u32)).unwrap_or(&0);
-                            let mut restas_pendientes = restas_pendientes.lock().unwrap();
-                            let puntos_bloqueados = restas_pendientes
+                        SUMAR_PUNTOS => {
+                            if self.obtener_coordinador() == self.id {
+                                let id_transaccion = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
+                                if transacciones_ack.contains(&id_transaccion) {
+                                    socket
+                                    .send_to(&[ACK, buffer[1], buffer[2], 0, 0, 0, 0, 0], response.unwrap().1)
+                                    .unwrap();
+                                    continue;
+                                }
+                                let cuenta = buffer[3];
+                                let puntos = i32::from_be_bytes(buffer[4..].try_into().unwrap());
+                                println!(
+                                    "[COORDINADOR {}] Sumar {} puntos a la cuenta {}",
+                                    self.id, puntos, cuenta
+                                );
+                                let mut cuentas = self.cuentas.lock().unwrap();
+                                let puntos_actuales = cuentas.entry(cuenta as u32).or_insert(0);
+                                *puntos_actuales += puntos as i32;
+                                println!(
+                                    "[COORDINADOR {}] Puntos nuevos de la cuenta {}: {}",
+                                    self.id, cuenta, puntos_actuales
+                                );
+                                socket
+                                    .send_to(&[ACK, buffer[1], buffer[2], 0, 0, 0, 0, 0], response.unwrap().1)
+                                    .unwrap();
+                                    self.broadcast_info(socket, cuenta, *puntos_actuales);
+                                transacciones_ack.push(id_transaccion);
+                            }
+                        }
+                        PREPARE_RESTAR_PUNTOS => {
+                            if self.obtener_coordinador() == self.id {
+                                let id = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
+                                let cuenta = buffer[3];
+                                let puntos = i32::from_be_bytes(buffer[4..].try_into().unwrap());
+                                println!(
+                                    "[NODO {}] PREPARE_RESTAR_PUNTOS recibido de {}",
+                                    self.id, id
+                                );
+                                let cuentas = self.cuentas.lock().unwrap();
+                                let puntos_actuales = cuentas.get(&(cuenta as u32)).unwrap_or(&0);
+                                let mut restas_pendientes = restas_pendientes.lock().unwrap();
+                                let puntos_bloqueados = restas_pendientes
                                 .iter()
                                 .filter(|(_, v)| v.0 == cuenta as u32)
                                 .map(|(_, v)| v.1)
-                                .sum::<i32>();
+                                    .sum::<i32>();
 
-                            if (*puntos_actuales - puntos_bloqueados) >= puntos {
-                                restas_pendientes.insert(id, (cuenta as u32, puntos));
-                                socket
-                                    .send_to(&[OK, buffer[1], buffer[2], 0, 0, 0, 0, 0], resp.1)
-                                    .unwrap();
-                            } else {
-                                socket
+                                if (*puntos_actuales - puntos_bloqueados) >= puntos {
+                                    restas_pendientes.insert(id, (cuenta as u32, puntos));
+                                    socket
+                                        .send_to(&[OK, buffer[1], buffer[2], 0, 0, 0, 0, 0], resp.1)
+                                        .unwrap();
+                                } else {
+                                    socket
                                     .send_to(&[ABORT, buffer[1], buffer[2], 0, 0, 0, 0, 0], resp.1)
                                     .unwrap();
+                                }
                             }
                         }
-                    }
-                    COMMIT_RESTAR_PUNTOS => {
-                        if self.obtener_coordinador() == self.id {
+                        COMMIT_RESTAR_PUNTOS => {
+                            if self.obtener_coordinador() == self.id {
+                                let id = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
+                                println!(
+                                    "[NODO {}] COMMIT_RESTAR_PUNTOS recibido de {}",
+                                    self.id, id
+                                );
+                                let mut restas = restas_pendientes.lock().unwrap();
+                                let (cuenta, puntos) = restas.remove(&id).unwrap();
+                                let mut cuentas = self.cuentas.lock().unwrap();
+                                let puntos_actuales = cuentas.entry(cuenta).or_insert(0);
+                                *puntos_actuales -= puntos;
+                                println!(
+                                    "[COORDINADOR {}] Puntos nuevos de la cuenta {}: {}",
+                                    self.id, cuenta, puntos_actuales
+                                );
+                                self.broadcast_info(socket, cuenta as u8, *puntos_actuales);
+                            }
+                        }
+                        OK => {
+                            println!("[NODO {}] OK recibido", self.id);
                             let id = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
-                            println!(
-                                "[NODO {}] COMMIT_RESTAR_PUNTOS recibido de {}",
-                                self.id, id
-                            );
-                            let mut restas = restas_pendientes.lock().unwrap();
-                            let (cuenta, puntos) = restas.remove(&id).unwrap();
+                            let (lock, cvar) = &*transacciones;
+                            lock.lock().unwrap().insert(id, Some(EstadoTransaccion::Ok));
+                            cvar.notify_all();
+                        }
+                        ABORT => {
+                            println!("[NODO {}] ABORT recibido", self.id);
+                            let id = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
+                            let (lock, cvar) = &*transacciones;
+                            lock.lock().unwrap().insert(id, Some(EstadoTransaccion::Abort));
+                            cvar.notify_all();
+                        }
+                        INFO => {
+                            let cuenta = buffer[1];
+                            let puntos = i32::from_be_bytes(buffer[2..=5].try_into().unwrap());
                             let mut cuentas = self.cuentas.lock().unwrap();
-                            let puntos_actuales = cuentas.entry(cuenta).or_insert(0);
-                            *puntos_actuales -= puntos;
-                            println!(
-                                "[COORDINADOR {}] Puntos nuevos de la cuenta {}: {}",
-                                self.id, cuenta, puntos_actuales
-                            );
-                            self.broadcast_info(socket, cuenta as u8, *puntos_actuales);
+                            cuentas.insert(cuenta as u32, puntos);
+                            for (cuenta, puntos) in cuentas.iter() {
+                                println!("[NODO {}] Cuenta {}: {}", self.id, cuenta, puntos);
+                            }
                         }
-                    }
-                    OK => {
-                        println!("[NODO {}] OK recibido", self.id);
-                        let id = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
-                        let (lock, cvar) = &*transacciones;
-                        lock.lock().unwrap().insert(id, Some(EstadoTransaccion::Ok));
-                        cvar.notify_all();
-                    }
-                    ABORT => {
-                        println!("[NODO {}] ABORT recibido", self.id);
-                        let id = u16::from_be_bytes(buffer[1..=2].try_into().unwrap());
-                        let (lock, cvar) = &*transacciones;
-                        lock.lock().unwrap().insert(id, Some(EstadoTransaccion::Abort));
-                        cvar.notify_all();
-                    }
-                    INFO => {
-                        let cuenta = buffer[1];
-                        let puntos = i32::from_be_bytes(buffer[2..=5].try_into().unwrap());
-                        let mut cuentas = self.cuentas.lock().unwrap();
-                        cuentas.insert(cuenta as u32, puntos);
-                        for (cuenta, puntos) in cuentas.iter() {
-                            println!("[NODO {}] Cuenta {}: {}", self.id, cuenta, puntos);
+                        PEDIR_INFO => {
+                            let cuentas = self.cuentas.lock().unwrap();
+                            let addr = response.unwrap().1;
+                            println!("[NODO {}] Enviando info a {}", self.id, addr);
+                            for (cuenta, puntos) in cuentas.iter() {
+                                let puntos = puntos.to_be_bytes();
+                                socket
+                                    .send_to(
+                                        &[
+                                            INFO,
+                                            *cuenta as u8,
+                                            puntos[0],
+                                            puntos[1],
+                                            puntos[2],
+                                            puntos[3],
+                                            0,
+                                            0,
+                                        ],
+                                        &addr,
+                                    )
+                                    .unwrap();
+                            }
+                            socket.send_to(&[INFO_ACK,0,0,0,0,0,0,0], &addr).unwrap();
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
+            }
+        }
+    }
+
+    fn pedir_info (&self, socket: &UdpSocket, id: usize) {
+        if id == self.id {
+            return;
+        }
+        let mut buffer = [0; 8];
+        buffer[0] = PEDIR_INFO;
+        socket.send_to(&buffer, address_data(id)).unwrap();
+        let mut recibio_ack = false;
+        while !recibio_ack {
+            let mut buffer = [0; 8];
+            let response = socket.recv_from(&mut buffer);
+            if response.is_ok() {
+                if buffer[0] == INFO_ACK {
+                    self.en_linea.store(true, Ordering::Relaxed);
+                    let mut clone = self.clone();
+                    thread::spawn(move || clone.empezar_eleccion());
+                    recibio_ack = true;
+                } else if buffer[0] == INFO {
+                    let cuenta = buffer[1];
+                    let puntos = i32::from_be_bytes(buffer[2..=5].try_into().unwrap());
+                    let mut cuentas = self.cuentas.lock().unwrap();
+                    cuentas.insert(cuenta as u32, puntos);
+                    for (cuenta, puntos) in cuentas.iter() {
+                        println!("[NODO {}] Cuenta {}: {}", self.id, cuenta, puntos);
+                    }
+                }
+            } else {
+                self.pedir_info(socket, (id + 1) % CANT_CAFETERAS);
             }
         }
     }
@@ -402,7 +455,9 @@ impl Cafeteria {
         if siguiente == self.id {
             // offline
             self.en_linea.store(false, Ordering::Relaxed);
+            println!("[NODO {}] Estoy offline", self.id);
             *self.coordinador.0.lock().unwrap() = Some(self.id);
+            return;
         }
         *self.election_ack.0.lock().unwrap() = None;
         self.election_socket
