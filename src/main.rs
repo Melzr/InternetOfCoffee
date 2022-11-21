@@ -12,7 +12,9 @@ fn main() {
                 .name(format!("Cafeteria {}", id))
                 .spawn(move || {
                     let mut node = Cafeteria::new(id, format!("./pedidos/pedidos{}.txt", id));
-                    node.run()
+                    if let Err(msg) = node.run() {
+                        println!("[ERROR] nodo {}: {}", id, msg);
+                    }
                 })
                 .unwrap(),
         );

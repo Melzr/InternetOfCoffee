@@ -11,7 +11,7 @@ pub const TIEMPO_PEDIDO: Duration = Duration::from_secs(1);
 pub struct Pedido {
     pub id: usize,
     /// id de la cuenta que realiza el pedido
-    pub cuenta: u32,
+    pub cuenta: u8,
     /// cantidad de puntos a restar o sumar
     pub puntos: i32,
 }
@@ -43,12 +43,13 @@ pub type Pedidos = Arc<(Mutex<PedidosInfo>, Condvar)>;
 /// # Formato del archivo
 /// Cada línea del archivo se interpreta como un [Pedido] con el formato `id_cuenta;puntos`.
 /// El id del pedido será el número de línea.
+/// Los pedidos que no se puedan parsear correctamente serán ignorados.
 pub fn leer_pedidos(reader: BufReader<std::fs::File>, pedidos: &Pedidos) {
     for (id_pedido, line) in reader.lines().enumerate() {
         if let Ok(line) = line {
             let mut split = line.split(';');
             if let (Some(cuenta), Some(puntos)) = (split.next(), split.next()) {
-                if let (Ok(cuenta), Ok(puntos)) = (cuenta.parse::<u32>(), puntos.parse::<i32>()) {
+                if let (Ok(cuenta), Ok(puntos)) = (cuenta.parse::<u8>(), puntos.parse::<i32>()) {
                     let pedido = Pedido {
                         id: id_pedido,
                         cuenta,
