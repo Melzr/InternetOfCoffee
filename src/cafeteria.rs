@@ -399,7 +399,8 @@ impl Cafeteria {
     }
 
     fn responder(&mut self) {
-        while !self.fin.load(Ordering::Relaxed) {
+        // while !self.fin.load(Ordering::Relaxed) {
+        loop {
             let mut buf = [0; 1 + size_of::<usize>() + (CANT_CAFETERIAS + 1) * size_of::<usize>()];
             // self.socket.set_read_timeout(Some(TIMEOUT / 4)).unwrap();
             let (_, id_sender) = self.election_socket.recv_from(&mut buf).unwrap();
