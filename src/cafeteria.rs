@@ -60,8 +60,17 @@ impl Cafeteria {
 
     pub fn run(&mut self) {
         let mut handles = Vec::new();
-        let file = std::fs::File::open(&self.pedidos_path).unwrap();
-        let reader = std::io::BufReader::new(file);
+        let reader;
+        match std::fs::File::open(&self.pedidos_path) {
+            Ok(file) => {
+                reader = std::io::BufReader::new(file);
+            }
+            Err(_) => {
+                println!("[ERROR] Archivo de pedidos no encontrado");
+                return;
+            }
+        }
+ 
         let data_socket = UdpSocket::bind(address_data(self.id)).unwrap();
         data_socket
             .set_read_timeout(Some(TIMEOUT))

@@ -11,7 +11,7 @@ fn main() {
             thread::Builder::new()
                 .name(format!("Cafeteria {}", id))
                 .spawn(move || {
-                    let mut node = Cafeteria::new(id, format!("./ejemplos/pedidos{}.txt", id));
+                    let mut node = Cafeteria::new(id, format!("./pedidos/pedidos{}.txt", id));
                     node.run()
                 })
                 .unwrap(),
@@ -19,6 +19,8 @@ fn main() {
     }
 
     for handle in node_threads {
-        handle.join().unwrap();
+        if handle.join().is_err() {
+            println!("[WARN] Error en el join de un nodo");
+        }
     }
 }

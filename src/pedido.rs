@@ -40,13 +40,35 @@ pub type Pedidos = Arc<(Mutex<PedidosInfo>, Condvar)>;
 /// El id del pedido será el número de línea.
 pub fn leer_pedidos(reader: BufReader<std::fs::File>, pedidos: &Pedidos) {
     for (id_pedido, line) in reader.lines().enumerate() {
-        let line = line.unwrap();
-        let mut split = line.split(';');
-        let id_cuenta = split.next().unwrap().parse::<u32>().unwrap();
-        let puntos = split.next().unwrap().parse::<i32>().unwrap();
-        let pedido = Pedido { id: id_pedido, cuenta: id_cuenta, puntos };
-        pedidos.0.lock().unwrap().cola_pedidos.push_back(pedido);
-        pedidos.1.notify_one();
+        if let Ok(line) = line {
+            let mut split = line.split(';');
+            if let (Some(cuenta), Some(puntos)) = (split.next(), split.next()) {
+                if let (Ok(cuenta), Ok(puntos)) = (cuenta.parse::<u32>(), puntos.parse::<i32>()) {
+                    let pedido = Pedido { id: id_pedido, cuenta, puntos};
+                    match pedidos.0.lock() {
+                        Ok(mut pedidos_data) => {
+                            pedidos_data.cola_pedidos.push_back(pedido);
+                            pedidos.1.notify_one();
+                        },
+                        Err(_) => {
+                            println!("[ERROR] Error al obtener el lock de pedidos");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
         thread::sleep(TIEMPO_PEDIDO);
+    }
+
+    match pedidos.0.lock() {
+        Ok(mut pedidos_data) => {
+            pedidos_data.fin = true;
+            pedidos.1.notify_all();
+        },
+        Err(_) => {
+            println!("[ERROR] Error al obtener el lock de pedidos");
+        }
     }
 }
