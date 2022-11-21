@@ -13,5 +13,5 @@ pub const INFO_ACK: u8 = b'K';
 #[derive(PartialEq, Eq)]
 pub enum EstadoTransaccion {
     Ok,
-    Abort
+    Abort,
 }
