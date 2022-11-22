@@ -6,7 +6,7 @@ use coffeewards::constantes::CANT_CAFETERIAS;
 fn main() {
     let mut node_threads = vec![];
 
-    for id in 1..CANT_CAFETERIAS {
+    for id in 0..CANT_CAFETERIAS {
         node_threads.push(
             thread::Builder::new()
                 .name(format!("Cafeteria {}", id))

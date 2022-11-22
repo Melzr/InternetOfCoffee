@@ -91,7 +91,10 @@ fn cafetera_pedido_resta(cafeteria: &mut Cafeteria, pedido: Pedido) {
             transaccion = state.remove(&id).unwrap();
         }
         if transaccion != Some(EstadoTransaccion::Ok) {
-            println!("[NODO {}] Transaccion abortada", cafeteria.id);
+            println!(
+                "[NODO {}] Transaccion abortada: pedido {}",
+                cafeteria.id, pedido.id
+            );
             return;
         }
 
@@ -109,8 +112,8 @@ fn cafetera_pedido_resta(cafeteria: &mut Cafeteria, pedido: Pedido) {
             .unwrap();
     } else {
         println!(
-            "[NODO {}] no se pueden restar puntos estando offline",
-            cafeteria.id
+            "[NODO {}] offline - no se puede realizar el pedido {}",
+            cafeteria.id, pedido.id
         );
     }
 }

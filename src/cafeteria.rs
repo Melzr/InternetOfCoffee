@@ -11,8 +11,9 @@ use crate::cafetera::cafetera;
 use crate::constantes::{CANT_CAFETERAS, CANT_CAFETERIAS, TIMEOUT};
 use crate::direcciones::{address_data, address_eleccion};
 use crate::mensajes_data::{
-    construir_paquete_data, obtener_data_paquete, EstadoTransaccion, Mensaje, ABORT, BUFFER,
-    COMMIT_RESTAR_PUNTOS, INFO, INFO_ACK, OK, PEDIR_INFO, PREPARE_RESTAR_PUNTOS, SUMAR_PUNTOS,
+    cafeteria_id, construir_paquete_data, obtener_data_paquete, pedido_id, EstadoTransaccion,
+    Mensaje, ABORT, BUFFER, COMMIT_RESTAR_PUNTOS, INFO, INFO_ACK, OK, PEDIR_INFO,
+    PREPARE_RESTAR_PUNTOS, SUMAR_PUNTOS,
 };
 use crate::mensajes_eleccion::{
     construir_paquete_eleccion, obtener_ids, ACK, BUFFER_ELECCION, COORDINATOR, ELECTION,
@@ -147,16 +148,11 @@ impl Cafeteria {
                 if ack_resp.1.timed_out() {
                     drop(sumas);
                     drop(ack_resp);
-                    println!("[NODO {}] No se recibió ACK", self.id);
-                    println!(
-                        "[NODO {}] coordinador {} murio",
-                        self.id,
-                        self.coordinador.0.lock().unwrap().unwrap()
-                    );
+                    println!("[NODO {}] No se recibió ACK del coordinador", self.id);
                     *(self.coordinador.0.lock().unwrap()) = None;
                     self.empezar_eleccion();
                     let coordinador = self.obtener_coordinador();
-                    println!("[NODO {}] encontre coordinador {}", self.id, coordinador);
+                    println!("[NODO {}] nuevo coordinador {}", self.id, coordinador);
                 } else {
                     let acks_to_remove: Vec<u16> = ack_resp
                         .0
@@ -212,7 +208,11 @@ impl Cafeteria {
     /// * `ack` - Mapa de acks de data
     /// * `buffer` - Buffer de datos
     fn recibir_ack(&self, ack: &Arc<(Mutex<HashMap<u16, bool>>, Condvar)>, data: Mensaje) {
-        println!("[NODO {}] ACK recibido", self.id);
+        println!(
+            "[NODO {}] ACK recibido por el pedido {}",
+            self.id,
+            pedido_id(data.transaccion)
+        );
         let (lock, cvar) = &**ack;
         lock.lock().unwrap().insert(data.transaccion, true);
         cvar.notify_all();
@@ -226,10 +226,18 @@ impl Cafeteria {
     /// * `transacciones` - Mapa de transacciones
     fn recibir_estado_transaccion(&self, data: Mensaje, transacciones: &Transacciones) {
         let estado = if data.accion == OK {
-            println!("[NODO {}] OK recibido", self.id);
+            println!(
+                "[NODO {}] OK recibido por el pedido {}",
+                self.id,
+                pedido_id(data.transaccion)
+            );
             EstadoTransaccion::Ok
         } else {
-            println!("[NODO {}] ABORT recibido", self.id);
+            println!(
+                "[NODO {}] ABORT recibido por el pedido {}",
+                self.id,
+                pedido_id(data.transaccion)
+            );
             EstadoTransaccion::Abort
         };
         let (lock, cvar) = &**transacciones;
@@ -299,8 +307,9 @@ impl Cafeteria {
     ) {
         if self.obtener_coordinador() == self.id {
             println!(
-                "[NODO {}] PREPARE_RESTAR_PUNTOS recibido de {}",
-                self.id, data.transaccion
+                "[COORDINADOR {}] PREPARE_RESTAR_PUNTOS recibido de {}",
+                self.id,
+                cafeteria_id(data.transaccion)
             );
             let cuentas = self.cuentas.lock().unwrap();
             let timestamp = SystemTime::now()
@@ -332,7 +341,11 @@ impl Cafeteria {
     /// * `restas_pendientes` - Mapa de restas pendientes
     fn restar_puntos(&self, data: Mensaje, restas_pendientes: &mut HashMap<u16, (u8, u32)>) {
         if self.obtener_coordinador() == self.id {
-            println!("[COORDINADOR {}] COMMIT_RESTAR_PUNTOS recibido", self.id);
+            println!(
+                "[COORDINADOR {}] COMMIT_RESTAR_PUNTOS recibido de {}",
+                self.id,
+                cafeteria_id(data.transaccion)
+            );
             let (cuenta, _) = restas_pendientes.remove(&data.transaccion).unwrap();
             let mut cuentas = self.cuentas.lock().unwrap();
             let timestamp = SystemTime::now()
@@ -362,7 +375,7 @@ impl Cafeteria {
             cuentas.insert(data.cuenta, (data.puntos, data.timestamp));
         }
         for (cuenta, puntos) in cuentas.iter() {
-            println!("[NODO {}] Cuenta {}: {}", self.id, cuenta, puntos.0);
+            println!("[NODO {}] [INFO] Cuenta {}: {}", self.id, cuenta, puntos.0);
         }
     }
 
@@ -392,10 +405,9 @@ impl Cafeteria {
                     let mut cuentas = self.cuentas.lock().unwrap();
                     cuentas.insert(data.cuenta, (data.puntos, data.timestamp));
                     for (cuenta, puntos) in cuentas.iter() {
-                        println!("[NODO {}] Cuenta {}: {}", self.id, cuenta, puntos.0);
+                        println!("[NODO {}] [INFO] Cuenta {}: {}", self.id, cuenta, puntos.0);
                     }
                 } else if data.accion == PEDIR_INFO && self.en_linea.load(Ordering::Relaxed) {
-                    println!("[NODO {}] Enviando info", self.id);
                     self.enviar_respuesta_control(None, res.1, INFO_ACK);
                 }
             } else {
@@ -452,16 +464,16 @@ impl Cafeteria {
             if let Ok((_, id_sender)) = self.election_socket.recv_from(&mut buf) {
                 let accion = buf[0];
                 let mut ids = obtener_ids(&buf);
-    
+
                 match accion {
                     ACK => {
-                        println!("Nodo {} Recibi ACK de {}", self.id, id_sender);
+                        println!("[Nodo {}] Recibi ACK de {}", self.id, id_sender);
                         *self.election_ack.0.lock().unwrap() = Some(ids[0]);
                         self.election_ack.1.notify_all();
                     }
                     ELECTION => {
                         println!(
-                            "Nodo {} recibi ELECTION de {} contenido {:?}",
+                            "[Nodo {}] recibi ELECTION de {} contenido {:?}",
                             self.id, id_sender, ids
                         );
                         self.election_socket
@@ -473,13 +485,13 @@ impl Cafeteria {
                             self.coordinador.1.notify_all();
                             let paquete =
                                 construir_paquete_eleccion(b'C', &[nuevo_coordinador, self.id]);
-    
+
                             let clone = self.clone();
                             thread::spawn(move || clone.enviar_al_siguiente(&paquete, clone.id));
                         } else {
                             ids.push(self.id);
                             let paquete = construir_paquete_eleccion(b'E', &ids);
-    
+
                             let clone = self.clone();
                             thread::spawn(move || clone.enviar_al_siguiente(&paquete, clone.id));
                         }
@@ -497,7 +509,7 @@ impl Cafeteria {
                         if !ids[1..].contains(&self.id) {
                             ids.push(self.id);
                             let paquete = construir_paquete_eleccion(b'C', &ids);
-    
+
                             let clone = self.clone();
                             thread::spawn(move || clone.enviar_al_siguiente(&paquete, clone.id));
                         }
@@ -559,7 +571,7 @@ impl Cafeteria {
 
     /// Comienza una elección de coordinador mediante un mensaje [ELECTION].
     fn empezar_eleccion(&mut self) {
-        println!("[INFO] Nodo {} empezando eleccion", self.id);
+        println!("[Nodo {}] empezando eleccion", self.id);
         self.enviar_al_siguiente(&construir_paquete_eleccion(b'E', &[self.id]), self.id);
     }
 }

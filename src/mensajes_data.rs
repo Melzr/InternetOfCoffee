@@ -23,18 +23,22 @@ pub struct Mensaje {
     pub timestamp: u128,
 }
 
+/// Obtiene el id de la cafeteria a partir del id de transaccion.
 pub fn cafeteria_id(transaccion: u16) -> u8 {
     (transaccion >> 8) as u8
 }
 
+/// Obtiene el id del pedido a partir del id de transaccion.
 pub fn pedido_id(transaccion: u16) -> u8 {
     (transaccion & 0x00FF) as u8
 }
 
+/// Obtiene el id de transaccion a partir del id de la cafeteria y el id del pedido.
 pub fn obtener_id_transaccion(cafeteria: u8, pedido: u8) -> u16 {
     u16::from_be_bytes([cafeteria, pedido])
 }
 
+/// Construye un buffer con los datos recibidos.
 pub fn construir_paquete_data(
     action: u8,
     transaccion: Option<u16>,
@@ -59,6 +63,7 @@ pub fn construir_paquete_data(
     buffer
 }
 
+/// Parsea el buffer recibido.
 pub fn obtener_data_paquete(buffer: &[u8; 24]) -> Mensaje {
     let accion = buffer[0];
     let transaccion = u16::from_be_bytes([buffer[1], buffer[2]]);
