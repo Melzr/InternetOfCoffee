@@ -1,3 +1,4 @@
+pub mod cafetera;
 pub mod cafeteria;
 pub mod constantes;
 pub mod direcciones;

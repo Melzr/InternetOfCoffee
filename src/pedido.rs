@@ -41,6 +41,7 @@ pub type Pedidos = Arc<(Mutex<PedidosInfo>, Condvar)>;
 /// Lee pedidos y los encola en `pedidos.0`, notificando a la condvar.
 ///
 /// # Formato del archivo
+///
 /// Cada línea del archivo se interpreta como un [Pedido] con el formato `id_cuenta;puntos`.
 /// El id del pedido será el número de línea.
 /// Los pedidos que no se puedan parsear correctamente serán ignorados.
@@ -50,6 +51,9 @@ pub fn leer_pedidos(reader: BufReader<std::fs::File>, pedidos: &Pedidos) {
             let mut split = line.split(';');
             if let (Some(cuenta), Some(puntos)) = (split.next(), split.next()) {
                 if let (Ok(cuenta), Ok(puntos)) = (cuenta.parse::<u8>(), puntos.parse::<i32>()) {
+                    if puntos == 0 {
+                        continue;
+                    }
                     let pedido = Pedido {
                         id: id_pedido,
                         cuenta,

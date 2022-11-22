@@ -6,16 +6,22 @@ use coffeewards::constantes::CANT_CAFETERIAS;
 fn main() {
     let mut node_threads = vec![];
 
-    for id in 0..CANT_CAFETERIAS {
+    for id in 1..CANT_CAFETERIAS {
         node_threads.push(
             thread::Builder::new()
                 .name(format!("Cafeteria {}", id))
-                .spawn(move || {
-                    let mut node = Cafeteria::new(id, format!("./pedidos/pedidos{}.txt", id));
-                    if let Err(msg) = node.run() {
-                        println!("[ERROR] nodo {}: {}", id, msg);
-                    }
-                })
+                .spawn(
+                    move || match Cafeteria::new(id, format!("./pedidos/pedidos{}.txt", id)) {
+                        Ok(mut cafeteria) => {
+                            if let Err(msg) = cafeteria.run() {
+                                println!("[ERROR] nodo {}: {}", id, msg);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[ERROR] no se pudo crear la cafeteria {}: {}", id, e);
+                        }
+                    },
+                )
                 .unwrap(),
         );
     }
